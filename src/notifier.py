@@ -9,6 +9,7 @@ import ssl
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.header import Header
+from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, formatdate
@@ -16,6 +17,7 @@ from typing import List, Optional, Tuple
 
 from .astronomy import KNOWN_SPACEPORTS
 from .models import ProbabilityLevel
+from .plume_render import describe_shape_zh
 from .state import PendingAlert
 
 CST = timezone(timedelta(hours=8))
@@ -79,8 +81,15 @@ def _site_title_zh(site_key: str, fallback: str) -> str:
     return fallback or "区域发射场"
 
 
-def build_email_content(alerts: List[PendingAlert]) -> Tuple[str, str, str]:
-    """Return `(subject, plain_text_body, html_body)` for one or more pending rocket cloud alerts."""
+def build_email_content(
+    alerts: List[PendingAlert],
+    images: Optional[List[List[Tuple[str, float, bytes]]]] = None,
+) -> Tuple[str, str, str]:
+    """Return `(subject, plain_text_body, html_body)` for one or more pending rocket cloud alerts.
+
+    `images` (optional) is aligned with `alerts`; each entry is a list of
+    `(content_id, snapshot_sec, png_bytes)` simulated sky views referenced via `cid:` in the HTML.
+    """
     if not alerts:
         raise ValueError("alerts must not be empty")
 
@@ -122,6 +131,32 @@ def build_email_content(alerts: List[PendingAlert]) -> Tuple[str, str, str]:
         vis_end_cst = (ln.net_utc + timedelta(seconds=a.visible_end_sec or 360)).astimezone(CST)
         site_zh = _site_title_zh(ln.site_key, ln.location_name)
         fg_color, bg_color = _prob_colors(a.probability)
+        try:
+            shape_zh = describe_shape_zh(a)
+        except Exception:
+            shape_zh = ""
+        alert_imgs = images[idx - 1] if images and len(images) >= idx else []
+        sim_html = ""
+        if alert_imgs or shape_zh:
+            figs = "".join(
+                f'<div style="margin-top:8px;"><img src="cid:{html.escape(cid)}" width="600" '
+                f'alt="T+{int(t // 60)}分{int(t % 60):02d}秒 成都视角火箭云模拟" '
+                f'style="display:block;width:100%;max-width:600px;height:auto;border-radius:8px;border:1px solid #1f2937;">'
+                f'<div style="font-size:12px;color:#6b7280;margin-top:4px;">'
+                f'▲ 点火后 T+{int(t // 60)}分{int(t % 60):02d}秒（北京时间 '
+                f'{(ln.net_utc + timedelta(seconds=t)).astimezone(CST).strftime("%H:%M:%S")}）成都视角模拟</div></div>'
+                for cid, t, _ in alert_imgs
+            )
+            sim_html = (
+                '<div style="margin-top:14px;padding:12px;background:#0b1220;border-radius:8px;color:#e5e7eb;">'
+                '<div style="font-size:14px;font-weight:700;margin-bottom:6px;">🪼 火箭云形状模拟</div>'
+                f'<div style="font-size:13px;line-height:1.6;color:#cbd5e1;">{html.escape(shape_zh)}</div>'
+                f"{figs}"
+                '<div style="font-size:11px;color:#94a3b8;margin-top:8px;line-height:1.5;">'
+                "图例：横轴为成都观测方位角（S=正南），纵轴为仰角；白/蓝白色为受阳光照射的高空羽流，"
+                "金/橙色为贴近地影边界的尾迹，暗灰为处于地影中的低空尾迹，红点为各分钟火箭位置，亮点及钟形光罩为二级箭体与膨胀羽流。"
+                "基于典型弹道与几何光照推演的示意图，实际形态受具体弹道、发动机工况与高空风影响。</div></div>"
+            )
 
         update_note_txt = ""
         update_banner_html = ""
@@ -150,6 +185,7 @@ def build_email_content(alerts: List[PendingAlert]) -> Tuple[str, str, str]:
                 f"  光学参数：成都太阳高度角 {a.chengdu_sun_alt_at_liftoff_deg:+.1f}° | 峰值羽流高度 {plume_alt_str} | 日照余量 {sun_margin_str}",
                 f"  判定说明：{a.reason_zh}",
                 f"  观测建议：{a.viewing_tips_zh}",
+                f"  形状模拟：{shape_zh}" if shape_zh else "  形状模拟：-",
                 f"  数据来源：{sources_str} ({ln.info_url})",
                 "-" * 52,
             ]
@@ -202,6 +238,7 @@ def build_email_content(alerts: List[PendingAlert]) -> Tuple[str, str, str]:
                 <div><strong>🔭 物理判定：</strong>{html.escape(a.reason_zh)}</div>
                 <div style="margin-top:6px;"><strong>📸 成都观测建议：</strong>{html.escape(a.viewing_tips_zh)}</div>
               </div>
+              {sim_html}
               <div style="margin-top:12px;font-size:12px;color:#9ca3af;">
                 数据来源：{html.escape(sources_str)} ·
                 <a href="{html.escape(ln.info_url)}" style="color:#2563eb;text-decoration:none;">查看发射详情 →</a>
@@ -235,16 +272,46 @@ def build_email_content(alerts: List[PendingAlert]) -> Tuple[str, str, str]:
     return subject, plain_body, html_body
 
 
-def send_email_notification(config: SMTPConfig, subject: str, plain_body: str, html_body: str) -> None:
-    """Send multipart HTML + plain-text email via SMTP SSL (465) or STARTTLS (587)."""
-    msg = MIMEMultipart("alternative")
+def build_mime_message(
+    config: SMTPConfig,
+    subject: str,
+    plain_body: str,
+    html_body: str,
+    images: Optional[List[List[Tuple[str, float, bytes]]]] = None,
+) -> MIMEMultipart:
+    """Build multipart/related (alternative text+html, inline PNG simulations)."""
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(plain_body, "plain", "utf-8"))
+    alt.attach(MIMEText(html_body, "html", "utf-8"))
+
+    flat = [img for group in (images or []) for img in group]
+    if flat:
+        msg = MIMEMultipart("related")
+        msg.attach(alt)
+        for cid, t, png in flat:
+            part = MIMEImage(png, _subtype="png")
+            part.add_header("Content-ID", f"<{cid}>")
+            part.add_header("Content-Disposition", "inline", filename=f"rocket-cloud-T{int(t)}s.png")
+            msg.attach(part)
+    else:
+        msg = alt
+
     msg["Subject"] = Header(subject, "utf-8")
     msg["From"] = formataddr((str(Header("成都火箭云监测助手", "utf-8")), config.sender))
     msg["To"] = ", ".join(config.recipients)
     msg["Date"] = formatdate(localtime=True)
+    return msg
 
-    msg.attach(MIMEText(plain_body, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+def send_email_notification(
+    config: SMTPConfig,
+    subject: str,
+    plain_body: str,
+    html_body: str,
+    images: Optional[List[List[Tuple[str, float, bytes]]]] = None,
+) -> None:
+    """Send the alert via SMTP SSL (465) or STARTTLS (587)."""
+    msg = build_mime_message(config, subject, plain_body, html_body, images)
 
     use_ssl = config.security == "ssl" or (config.security == "auto" and config.port == 465)
     context = ssl.create_default_context()

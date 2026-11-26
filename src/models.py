@@ -124,3 +124,6 @@ class VisibilityAssessment:
     max_elevation_deg: float
     reason_zh: str
     viewing_tips_zh: str
+    pad_lat: Optional[float] = None
+    pad_lon: Optional[float] = None
+    corridor_az_deg: Optional[float] = None

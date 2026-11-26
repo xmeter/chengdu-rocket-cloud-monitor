@@ -407,6 +407,7 @@ def evaluate_chengdu_visibility(
 
     best_overall_prob = ProbabilityLevel.NONE
     best_corridor_label = corridors[0][0]
+    best_corridor_az = corridors[0][1]
     best_corridor_samples: List[PlumeSample] = []
     best_peak_sample: Optional[PlumeSample] = None
     best_score = -1e9
@@ -474,6 +475,7 @@ def evaluate_chengdu_visibility(
             best_overall_prob = prob
             best_score = corridor_best_score
             best_corridor_label = corridor_label
+            best_corridor_az = az_deg
             best_corridor_samples = qualifying
             best_peak_sample = corridor_best_sample
 
@@ -547,4 +549,7 @@ def evaluate_chengdu_visibility(
         max_elevation_deg=max_el,
         reason_zh=reason,
         viewing_tips_zh=tips,
+        pad_lat=pad_lat,
+        pad_lon=pad_lon,
+        corridor_az_deg=best_corridor_az,
     )

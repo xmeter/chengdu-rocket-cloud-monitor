@@ -13,6 +13,7 @@ from typing import List, Optional
 from .astronomy import KNOWN_SPACEPORTS, evaluate_chengdu_visibility, solar_alt_az
 from .models import LaunchEvent, ProbabilityLevel, VisibilityAssessment
 from .notifier import CST, SMTPConfig, build_email_content, send_email_notification
+from .plume_render import render_alert_images
 from .sources import fetch_all_upcoming_launches
 from .state import NotificationStateStore, PendingAlert
 
@@ -174,19 +175,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         _write_github_output(args.github_output, notified_count=0, state_changed=False)
         return 0
 
-    subject, plain_body, html_body = build_email_content(pending_alerts)
+    images = render_alert_images([p.assessment for p in pending_alerts])
+    subject, plain_body, html_body = build_email_content(pending_alerts, images)
     print("\n================ 待发送邮件预览 ================")
     print(f"主题: {subject}\n")
     print(plain_body)
     print("================================================\n")
 
     if args.dry_run:
-        logging.info("--dry-run 模式：跳过 SMTP 发送与状态写入。")
+        preview_dir = Path(__file__).resolve().parent.parent / "preview"
+        preview_dir.mkdir(exist_ok=True)
+        (preview_dir / "email.html").write_text(
+            html_body.replace('src="cid:', 'src="').replace("@rocketcloud", "@rocketcloud.png"), encoding="utf-8"
+        )
+        for group in images:
+            for cid, _, png in group:
+                (preview_dir / f"{cid}.png").write_bytes(png)
+        logging.info("--dry-run 模式：跳过 SMTP 发送与状态写入。邮件预览已保存到 %s/email.html", preview_dir)
         _write_github_output(args.github_output, notified_count=0, state_changed=False)
         return 0
 
     smtp_cfg = SMTPConfig.from_env()
-    send_email_notification(smtp_cfg, subject, plain_body, html_body)
+    send_email_notification(smtp_cfg, subject, plain_body, html_body, images)
     logging.info("邮件预警发送成功！收件人: %s", ", ".join(smtp_cfg.recipients))
 
     state_changed = False
